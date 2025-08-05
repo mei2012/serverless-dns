@@ -13,12 +13,15 @@ import {
   decryptAesGcm,
   hkdfaes,
   hkdfalgkeysz,
+  hkdfhmac,
+  hmacsign,
   sha512,
 } from "../../commons/crypto.js";
 import * as envutil from "../../commons/envutil.js";
 import * as util from "../../commons/util.js";
 
-const ctx = bufutil.fromStr("encryptcrossservice");
+const encctx = bufutil.fromStr("encryptcrossservice");
+const macctx = bufutil.fromStr("authorizecrossservice");
 
 /**
  * @param {String} TLS_CRT_KEY - Contains base64 (no wrap) encoded key and
@@ -46,37 +49,62 @@ export function getCertKeyFromEnv(TLS_CRT_KEY) {
 
 /**
  * @param {X509Certificate} replacing - The X509Certificate to replace the existing one
- * @returns {Promise<[BufferSource, BufferSource]>} - The key and certificate as ArrayBuffers
+ * @returns {Promise<[BufferSource|null, BufferSource|null]>} - The key and certificate as ArrayBuffers
  */
 export async function replaceKeyCert(replacing) {
-  if (replacing == null) return [null, null];
+  const nokeycert = [null, null];
+
+  if (replacing == null) return nokeycert;
   if (
     replacing.subject.indexOf("rethinkdns.com") < 0 ||
     replacing.subjectAltName.indexOf("rethinkdns.com") < 0
   ) {
-    return [null, null];
+    return nokeycert;
   }
 
   try {
-    const req = new Request("https://redir.nile.workers.dev/x/crt", {
+    const [aeskey, mackey] = await keys();
+    if (!aeskey || !mackey) {
+      log.e("certfile: key missing");
+      return nokeycert;
+    }
+
+    const now = Date.now();
+    const u = "https://redir.nile.workers.dev/x/crt/" + now;
+    const url = new URL(u);
+    // TODO: bind "who" to msg?
+    const msg = bufutil.fromStr(url.pathname);
+    const authz = await hmacsign(mackey, msg);
+    const who = envutil.hostId(); // never empty on fly
+    const req = new Request(url, {
       method: "GET",
+      headers: {
+        "x-rethinkdns-xsvc-authz": bufutil.hex(authz),
+        "x-rethinkdns-xsvc-who": who,
+      },
     });
     const r = await fetch(req);
+
+    if (!r.ok) {
+      log.e("certfile: fetch err", who, authz.length, r.status, r.statusText);
+      return nokeycert;
+    }
+
     const crthex = await r.text();
     if (util.emptyString(crthex)) {
       log.e("certfile: empty response");
-      return [null, null];
+      return nokeycert;
     }
 
     const crtkey = await decryptText(req, crthex);
     if (util.emptyString(crtkey)) {
       log.e("certfile: empty enc(crtkey)");
-      return [null, null];
+      return nokeycert;
     }
     const [key, cert] = getCertKeyFromEnv(crtkey);
     if (bufutil.emptyBuf(key) || bufutil.emptyBuf(cert)) {
       log.e("certfile: key/cert empty");
-      return [null, null];
+      return nokeycert;
     }
 
     const latest = new X509Certificate(cert);
@@ -85,12 +113,12 @@ export async function replaceKeyCert(replacing) {
       latest.subjectAltName.indexOf("rethinkdns.com") < 0
     ) {
       log.e("certfile: latest cert subject mismatch", latest.subject);
-      return [null, null];
+      return nokeycert;
     }
 
     if (latest.serialNumber === replacing.serialNumber) {
       log.d("certfile: latest cert same as replacing", latest.serialNumber);
-      return [null, null];
+      return [key, cert];
     }
 
     const latestUntil = new Date(latest.validTo);
@@ -106,7 +134,7 @@ export async function replaceKeyCert(replacing) {
         "now",
         Date.now()
       );
-      return [null, null];
+      return nokeycert;
     }
 
     log.i("certfile: latest cert", latest.serialNumber, "until", latestUntil);
@@ -115,7 +143,7 @@ export async function replaceKeyCert(replacing) {
   } catch (err) {
     log.e("certfile: failed to get cert", err);
   }
-  return [null, null];
+  return nokeycert;
 }
 
 /**
@@ -126,6 +154,7 @@ export async function replaceKeyCert(replacing) {
 export async function decryptText(req, ivciphertaghex) {
   const now = new Date();
   const u = new URL(req.url);
+  const authn = req.headers.get("x-rethinkdns-xsvc-who");
   const ivciphertag = bufutil.hex2buf(ivciphertaghex);
   if (bufutil.emptyBuf(ivciphertag)) {
     log.e("decrypt: ivciphertag empty");
@@ -135,8 +164,11 @@ export async function decryptText(req, ivciphertaghex) {
   try {
     const iv = ivciphertag.slice(0, 12); // first 12 bytes are iv
     const ciphertag = ivciphertag.slice(12); // rest is cipher text + tag
+    // crypto.junod.info/posts/recursive-hash/#data-serialization
     // 1 Aug 2025 => "5/7/2025" => Friday, 7th month (0-indexed), 2025
     const aadstr =
+      authn +
+      "/" +
       now.getUTCDay() +
       "/" +
       now.getUTCMonth() +
@@ -162,8 +194,8 @@ export async function decryptText(req, ivciphertaghex) {
       aad.length
     );
 
-    const aeskey = await key();
-    if (!aeskey) {
+    const [aeskey, mackey] = await keys();
+    if (!aeskey || !mackey) {
       log.e("decrypt: key missing");
       return null;
     }
@@ -181,39 +213,43 @@ export async function decryptText(req, ivciphertaghex) {
 }
 
 /**
- * @returns {Promise<CryptoKey|null>} - Returns a CryptoKey or null if the key is missing or invalid
+ * @returns {Promise<[CryptoKey|null]>} - Returns a CryptoKey or null if the key is missing or invalid
  */
-async function key() {
-  if (bufutil.emptyBuf(ctx)) {
+async function keys() {
+  const nokeys = [null, null];
+  if (bufutil.emptyBuf(encctx) || bufutil.emptyBuf(macctx)) {
     log.e("key: ctx missing");
-    return null;
+    return nokeys;
   }
 
   const skhex = envutil.kdfSvcSecretHex();
   if (util.emptyString(skhex)) {
     log.e("key: KDF_SVC missing");
-    return null;
+    return nokeys;
   }
 
   const sk = bufutil.hex2buf(skhex);
   if (bufutil.emptyBuf(sk)) {
     log.e("key: kdf seed conv empty");
-    return null;
+    return nokeys;
   }
 
   if (sk.length < hkdfalgkeysz) {
     log.e("keygen: seed too short", sk.length, hkdfalgkeysz);
-    return null;
+    return nokeys;
   }
 
   try {
     const sk256 = sk.slice(0, hkdfalgkeysz);
     // info must always of a fixed size for ALL KDF calls
-    const info512 = await sha512(ctx);
+    const info512enc = await sha512(encctx);
+    const info512mac = await sha512(macctx);
     // exportable: crypto.subtle.exportKey("raw", key);
     // log.d("key fingerprint", bufutil.hex(await sha512(bufutil.concat(sk, info512)));
 
-    return hkdfaes(sk256, info512);
+    const aeskey = await hkdfaes(sk256, info512enc);
+    const mackey = await hkdfhmac(sk256, info512mac);
+    return [aeskey, mackey];
   } catch (ignore) {
     log.d("keygen: err", ignore);
   }
